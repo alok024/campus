@@ -57,8 +57,6 @@ class UmsError(RuntimeError):
     pass
 
 
-# --------------------------------------------------------------------------- admit filter
-
 ADMIT = {
     "course": re.compile(r"[A-Z]{2,4}\d{3,4}"),
     "room": re.compile(r"\d{2}-\d{3}[A-Z]?(?: [A-Z])?"),
@@ -102,8 +100,6 @@ def admit_int(value, low, high):
 def fingerprint(text):
     return hashlib.sha256(re.sub(r"\s+", " ", text or "").strip().encode()).hexdigest()[:12]
 
-
-# --------------------------------------------------------------------------- browser (CDP)
 
 def chrome_binary():
     system = platform.system()
@@ -296,8 +292,6 @@ class Browser:
         return self.js("location.href") or ""
 
 
-# --------------------------------------------------------------------------- login
-
 FORM_STATE_JS = """
 (function(){
   var u=document.querySelector('#txtU');
@@ -341,8 +335,6 @@ def login(browser, user, password, attempts=3):
     raise UmsError("login did not reach the dashboard; check your reg number/password "
                    "(UMS forces a password change every 90 days)")
 
-
-# --------------------------------------------------------------------------- readers + parse
 
 GRID_JS = r"""
 (function(){
@@ -585,8 +577,6 @@ def read_all(browser):
             "attendance": attendance, "messages": messages, "marked": marked}
 
 
-# --------------------------------------------------------------------------- change detection
-
 def _skey(s):
     return f"{s['day']} {s['start']}"
 
@@ -618,8 +608,6 @@ def changes(old, new):
             out.append(tag + m["title"])
     return out
 
-
-# --------------------------------------------------------------------------- calendar (.ics)
 
 def _esc(s):
     return s.replace("\\", "\\\\").replace(",", "\\,").replace(";", "\\;").replace("\n", "\\n")
@@ -672,8 +660,6 @@ def write_ics(snap, tasks):
     HOME.mkdir(parents=True, exist_ok=True)
     ICS.write_text("\r\n".join(lines) + "\r\n", encoding="utf-8")
 
-
-# --------------------------------------------------------------------------- notifications
 
 def notify(title, message):
     _desktop(title, message)
@@ -733,8 +719,6 @@ def telegram_chat_id(token):
             return str(chat["id"])
     return None
 
-
-# --------------------------------------------------------------------------- storage
 
 def ask(prompt):
     try:
@@ -807,8 +791,6 @@ def setup_telegram():
     print("  connected. Check Telegram for a test message.")
 
 
-# --------------------------------------------------------------------------- reminders
-
 def add_reminder(text, when_iso):
     tasks = load(TASKS, [])
     tasks.append({"id": fingerprint(text + when_iso)[:8], "text": text, "when": when_iso,
@@ -839,8 +821,6 @@ def due_reminders():
         save(TASKS, tasks)
     return fired
 
-
-# --------------------------------------------------------------------------- the agent
 
 def sync_once(user, password):
     with Browser() as br:
