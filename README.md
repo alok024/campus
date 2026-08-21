@@ -65,6 +65,30 @@ python campus.py bomb                                  # delete everything (see 
 
 Now cancellations and reminders reach your phone even when the laptop screen is off.
 
+## Keeping it always on
+
+campus only catches a change while it's running, so for round-the-clock alerts it needs to live
+on a machine that stays on. The simplest options:
+
+- **Leave it running on your laptop.** Fine if your laptop is usually on and online. Sleep pauses
+  it; it resumes when the laptop wakes.
+- **A spare/old machine at home** — an old laptop, a mini-PC, a Raspberry Pi with Chromium — left
+  plugged in. Telegram still delivers to your phone wherever you are. This is the real "set and
+  forget" setup.
+
+To run it without it asking questions each time (useful for a background machine), set the login
+as environment variables and it won't prompt:
+
+```
+CAMPUS_USER=12345678 CAMPUS_PASSWORD=yourpass python campus.py
+```
+
+**Free cloud hosting will not work**, and I tested this so you don't have to: UMS sits behind
+Cloudflare, which blocks the datacenter IP addresses that GitHub Actions, Oracle/AWS/GCP free
+tiers, and the like run on — the login never gets through. A real browser on a normal home
+internet connection is what passes the check. So "always on" means a device at home, not a
+free server.
+
 ## Your calendar, on your phone
 
 Run once so `campus.ics` exists (it prints the full path). In Google Calendar → **Settings →
