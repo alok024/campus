@@ -758,7 +758,7 @@ def ask(prompt):
 
 def ask_secret(prompt):
     try:
-        return ask_secret(prompt)
+        return getpass.getpass(prompt)
     except EOFError:
         return ""
 
