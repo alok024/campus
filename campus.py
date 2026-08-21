@@ -951,6 +951,15 @@ def usage():
 
 
 def main(argv):
+    try:
+        import websocket
+        websocket.create_connection
+    except ImportError:
+        print("campus needs one package that isn't installed: websocket-client")
+        print("try:   pip install websocket-client")
+        print("if that says 'externally-managed-environment', try:")
+        print("       pip install --break-system-packages websocket-client")
+        return 1
     if not argv:
         run_loop()
         return 0

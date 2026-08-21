@@ -32,7 +32,21 @@ small package:
 pip install websocket-client
 ```
 
-Then download **[`campus.py`](campus.py)** into a folder.
+Then download **[`campus.py`](https://raw.githubusercontent.com/alok024/campus/main/campus.py)**
+into a folder (right-click → Save As, or `curl -O <that link>`).
+
+> **Getting `error: externally-managed-environment`?** Newer Linux (Ubuntu/Mint/Debian) and Mac
+> (Homebrew) Python block plain `pip install` to protect the system. Run:
+> ```
+> pip install --break-system-packages websocket-client
+> ```
+> `websocket-client` is one small pure-Python package, so this is low-risk. Prefer not to touch
+> system packages at all? Use a virtual environment instead:
+> ```
+> python3 -m venv ~/.campus-env
+> ~/.campus-env/bin/pip install websocket-client
+> ```
+> and run the tool with `~/.campus-env/bin/python campus.py` from then on.
 
 > On a Linux server with no screen, also `sudo apt install xvfb` — UMS's bot-check needs a real
 > browser, and Xvfb gives it an invisible one. On a normal laptop you don't need this.
