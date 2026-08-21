@@ -1017,7 +1017,9 @@ def check(user, password):
         save(STATE, new)
         write_ics(new, load(TASKS, []))
         if diff:
-            notify("UMS changed", "\n".join(f"- {c}" for c in diff[:8]))
+            body = "\n".join(f"- {c}" for c in diff[:8])
+            body += "\n\n(re-import campus.ics into Google Calendar to update it there too)"
+            notify("UMS changed", body)
         for t in due_reminders():
             notify("Reminder", f"{t['text']} — due {t['when']}")
         return diff
