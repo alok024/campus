@@ -116,6 +116,18 @@ If you move or rename `campus.py` (or the folder it's in) after turning autostar
 still points at the old location and will quietly fail. Turn autostart off first, move things,
 then turn it back on.
 
+## Can it run on my phone instead of a laptop?
+
+No — and this isn't a "not built yet," it's a hard wall. UMS's login is protected by Cloudflare's
+bot-check, which only passes for a real desktop-class browser (Chrome/Edge); Termux on Android
+has no such browser, and trying to fake it by replaying a login cookie doesn't work either — UMS
+never hands one over to anything but the real browser. So the sync itself has to run somewhere
+with Chrome or Edge — a laptop or PC.
+
+Your phone's part is **receiving** the alerts, not running the sync: connect Telegram (above) and
+cancellations/reminders reach you instantly, wherever you are, even though the actual checking
+happens on a computer.
+
 ## Keeping it always on
 
 campus only catches a change while it's running, so for round-the-clock alerts it needs to live
