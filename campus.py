@@ -9,6 +9,8 @@ Run it:            python campus.py
 Add a reminder:    python campus.py remind "submit DBMS assignment" 2026-08-25 17:00
 List reminders:    python campus.py reminders
 Sync once and exit:python campus.py once
+Start on login:    python campus.py autostart
+Stop that:         python campus.py autostart off
 Delete everything: python campus.py bomb
 
 Needs: Python 3.9+, Google Chrome or Microsoft Edge, and one package:
@@ -22,8 +24,10 @@ import hashlib
 import json
 import os
 import platform
+import plistlib
 import re
 import shutil
+import signal
 import socket
 import subprocess
 import sys
@@ -41,6 +45,10 @@ CREDS = HOME / "creds.json"
 TASKS = HOME / "reminders.json"
 ICS = HOME / "campus.ics"
 PROFILE = HOME / "browser"
+LOCK = HOME / "campus.lock"
+PIDFILE = HOME / "campus.pid"
+FAILS = HOME / "fails.json"
+LOG = HOME / "campus.log"
 
 PORTAL = "https://ums.lpu.in/lpuums/"
 TIMETABLE = PORTAL + "Reports/frmStudentTimeTable.aspx"
@@ -780,6 +788,117 @@ def save(path, data):
             pass
 
 
+def _redirect_to_log_if_headless():
+    try:
+        if sys.stdout.isatty():
+            return
+    except (AttributeError, ValueError):
+        pass
+    HOME.mkdir(parents=True, exist_ok=True)
+    log = open(LOG, "a", encoding="utf-8", buffering=1)
+    sys.stdout = log
+    sys.stderr = log
+
+
+def _autostart_desktop_path():
+    return Path.home() / ".config" / "autostart" / "campus-agent.desktop"
+
+
+def _autostart_plist_path():
+    return Path.home() / "Library" / "LaunchAgents" / "dev.campus.agent.plist"
+
+
+def _autostart_task_name():
+    return f"campus-{getpass.getuser()}"
+
+
+def _desktop_quote(value):
+    escaped = value.replace("\\", "\\\\").replace('"', '\\"').replace("$", "\\$").replace("`", "\\`")
+    return f'"{escaped}"'
+
+
+def autostart_enable():
+    if not load(CREDS, None):
+        print("save your login first (run campus.py and say yes to saving) before enabling autostart.")
+        return False
+    python, script = sys.executable, str(Path(__file__).resolve())
+    system = platform.system()
+    if system == "Linux":
+        path = _autostart_desktop_path()
+        path.parent.mkdir(parents=True, exist_ok=True)
+        exec_line = " ".join(_desktop_quote(p) for p in (python, script))
+        path.write_text(
+            "[Desktop Entry]\nType=Application\nName=campus\n"
+            f"Exec={exec_line}\n"
+            "X-GNOME-Autostart-enabled=true\nTerminal=false\n",
+            encoding="utf-8",
+        )
+    elif system == "Darwin":
+        path = _autostart_plist_path()
+        path.parent.mkdir(parents=True, exist_ok=True)
+        with open(path, "wb") as fh:
+            plistlib.dump(
+                {"Label": "dev.campus.agent", "ProgramArguments": [python, script], "RunAtLoad": True},
+                fh,
+            )
+        subprocess.run(["launchctl", "unload", "-w", str(path)], capture_output=True)
+        try:
+            result = subprocess.run(["launchctl", "load", "-w", str(path)], capture_output=True)
+        except FileNotFoundError:
+            print("couldn't find launchctl — start campus.py by hand instead.")
+            return False
+        if result.returncode != 0:
+            print("macOS refused the autostart entry — start campus.py by hand instead,"
+                  " or check System Settings > Login Items.")
+            return False
+    elif system == "Windows":
+        tr = f'"{python}" "{script}"'
+        try:
+            result = subprocess.run(
+                ["schtasks", "/create", "/tn", _autostart_task_name(), "/tr", tr, "/sc", "onlogon", "/f"],
+                capture_output=True,
+            )
+        except FileNotFoundError:
+            print("couldn't find schtasks — start campus.py by hand instead.")
+            return False
+        if result.returncode != 0:
+            print("windows refused the autostart entry — start campus.py by hand instead.")
+            return False
+    else:
+        print(f"don't know how to autostart on {system} — start campus.py by hand.")
+        return False
+    print(f"campus will now start automatically when you log in. Undo with: "
+          f"{Path(sys.argv[0]).name} autostart off")
+    return True
+
+
+def autostart_disable():
+    system = platform.system()
+    removed = False
+    if system == "Linux":
+        path = _autostart_desktop_path()
+        removed = path.exists()
+        path.unlink(missing_ok=True)
+    elif system == "Darwin":
+        path = _autostart_plist_path()
+        removed = path.exists()
+        if removed:
+            subprocess.run(["launchctl", "unload", "-w", str(path)], capture_output=True)
+            path.unlink(missing_ok=True)
+    elif system == "Windows":
+        try:
+            result = subprocess.run(
+                ["schtasks", "/delete", "/tn", _autostart_task_name(), "/f"], capture_output=True
+            )
+            removed = result.returncode == 0
+        except FileNotFoundError:
+            removed = False
+    print("autostart removed." if removed
+          else "autostart wasn't on, or couldn't be removed automatically"
+               " — check your OS's startup/login-items settings.")
+    return removed
+
+
 def credentials():
     env_user, env_pass = os.environ.get("CAMPUS_USER"), os.environ.get("CAMPUS_PASSWORD")
     if env_user and env_pass:
@@ -796,6 +915,9 @@ def credentials():
     if keep:
         save(CREDS, {"user": user, "password": password})
         print(f"  saved to {CREDS} (owner-only). Use 'python campus.py bomb' to wipe everything.")
+        if ask("  start automatically when you log in, so you don't have to run this by hand"
+               " after a reboot? [y/N]: ").strip().lower() in ("y", "yes"):
+            autostart_enable()
     else:
         print("  not saved — it'll ask again next run.")
     return user, password
@@ -870,17 +992,37 @@ def _merge_forward(old, new):
     return new
 
 
+def _record_failure(exc):
+    n = load(FAILS, {"count": 0}).get("count", 0) + 1
+    save(FAILS, {"count": n})
+    if n == 3 or (n > 3 and n % 32 == 0):
+        notify("campus can't log in", f"UMS login has failed {n} times in a row: {exc}\n"
+               "Your password may have changed — run campus.py and re-enter it.")
+
+
+def _record_success():
+    FAILS.unlink(missing_ok=True)
+
+
 def check(user, password):
-    old = load(STATE, None)
-    new = _merge_forward(old, sync_once(user, password))
-    diff = changes(old, new)
-    save(STATE, new)
-    write_ics(new, load(TASKS, []))
-    if diff:
-        notify("UMS changed", "\n".join(f"- {c}" for c in diff[:8]))
-    for t in due_reminders():
-        notify("Reminder", f"{t['text']} — due {t['when']}")
-    return diff
+    HOME.mkdir(parents=True, exist_ok=True)
+    if LOCK.exists() and time.time() - LOCK.stat().st_mtime < 180:
+        print("another campus sync is already in progress — skipping this cycle.")
+        return []
+    LOCK.write_text(str(os.getpid()), encoding="utf-8")
+    try:
+        old = load(STATE, None)
+        new = _merge_forward(old, sync_once(user, password))
+        diff = changes(old, new)
+        save(STATE, new)
+        write_ics(new, load(TASKS, []))
+        if diff:
+            notify("UMS changed", "\n".join(f"- {c}" for c in diff[:8]))
+        for t in due_reminders():
+            notify("Reminder", f"{t['text']} — due {t['when']}")
+        return diff
+    finally:
+        LOCK.unlink(missing_ok=True)
 
 
 def run_once():
@@ -901,22 +1043,29 @@ def run_loop():
     print(f"calendar file kept fresh at: {ICS}")
     user, password = credentials()
     setup_telegram()
-    while True:
-        stamp = datetime.now().strftime("%H:%M")
-        try:
-            diff = check(user, password)
-            print(f"[{stamp}] {len(diff)} change(s):\n" + "\n".join(f"- {c}" for c in diff)
-                  if diff else f"[{stamp}] no change")
-        except UmsError as exc:
-            print(f"[{stamp}] sync skipped: {exc}")
-        except KeyboardInterrupt:
-            print("\nstopped.")
-            return
-        try:
-            time.sleep(INTERVAL_MIN * 60)
-        except KeyboardInterrupt:
-            print("\nstopped.")
-            return
+    HOME.mkdir(parents=True, exist_ok=True)
+    PIDFILE.write_text(str(os.getpid()), encoding="utf-8")
+    try:
+        while True:
+            stamp = datetime.now().strftime("%H:%M")
+            try:
+                diff = check(user, password)
+                print(f"[{stamp}] {len(diff)} change(s):\n" + "\n".join(f"- {c}" for c in diff)
+                      if diff else f"[{stamp}] no change")
+                _record_success()
+            except UmsError as exc:
+                print(f"[{stamp}] sync skipped: {exc}")
+                _record_failure(exc)
+            except KeyboardInterrupt:
+                print("\nstopped.")
+                return
+            try:
+                time.sleep(INTERVAL_MIN * 60)
+            except KeyboardInterrupt:
+                print("\nstopped.")
+                return
+    finally:
+        PIDFILE.unlink(missing_ok=True)
 
 
 def bomb():
@@ -925,6 +1074,13 @@ def bomb():
     if ask('Type DELETE to confirm: ').strip() != "DELETE":
         print("cancelled.")
         return
+    autostart_disable()
+    if PIDFILE.exists():
+        try:
+            os.kill(int(PIDFILE.read_text(encoding="utf-8").strip()), signal.SIGTERM)
+            print("stopped the background campus process that was running.")
+        except (OSError, ValueError):
+            pass
     if HOME.exists():
         shutil.rmtree(HOME, ignore_errors=True)
     print("done — campus wiped itself. Delete campus.py too if you're finished with it.")
@@ -961,6 +1117,7 @@ def main(argv):
         print("       pip install --break-system-packages websocket-client")
         return 1
     if not argv:
+        _redirect_to_log_if_headless()
         run_loop()
         return 0
     cmd = argv[0]
@@ -978,6 +1135,16 @@ def main(argv):
             print(f"{t['when']}  [{mark}]  {t['text']}")
     elif cmd == "chatid" and len(argv) >= 2:
         print(telegram_chat_id(argv[1]) or "no message found — send your bot 'hi' first, then retry")
+    elif cmd == "autostart":
+        arg = argv[1].lower() if len(argv) >= 2 else None
+        if arg is None:
+            autostart_enable()
+        elif arg == "off":
+            autostart_disable()
+        else:
+            print('use:  python campus.py autostart        (turn on)')
+            print('  or  python campus.py autostart off    (turn off)')
+            return 2
     elif cmd == "bomb":
         bomb()
     else:
