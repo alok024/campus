@@ -306,10 +306,17 @@ FORM_STATE_JS = """
 def login(browser, user, password, attempts=3):
     for _ in range(attempts):
         browser.goto(PORTAL)
-        if "StudentDashboard" in browser.url():
-            return
-        if not browser.js("!!document.querySelector('input[type=password]')"):
-            raise UmsError("the portal did not serve a login form")
+        deadline = time.time() + 45
+        ready = False
+        while time.time() < deadline:
+            if "StudentDashboard" in browser.url():
+                return
+            if browser.js("!!document.querySelector('input[type=password]')"):
+                ready = True
+                break
+            time.sleep(2)
+        if not ready:
+            continue
         browser.type_into("#txtU", user)
         browser.type_into("input[type=password]", password)
         deadline = time.time() + 25
@@ -542,12 +549,41 @@ def parse_marks(cells, year):
 
 
 def open_spa(browser, page):
-    routes = {"dashboard": "dashboard",
-              "calendar": "dashboard/calendar"}
-    browser.goto(SPA + routes[page], budget=60)
-    landed = browser.url()
-    if "studentums.lpu.in" not in landed or routes[page].rsplit("/", 1)[-1] not in landed:
-        raise UmsError(f"the {page} hand-off did not land; the session may have expired")
+    routes = {"dashboard": "dashboard", "calendar": "dashboard/calendar"}
+    tail = routes[page].rsplit("/", 1)[-1]
+    for _ in range(3):
+        browser.goto(SPA + routes[page], budget=60)
+        deadline = time.time() + 25
+        while time.time() < deadline:
+            landed = browser.url()
+            if "studentums.lpu.in" in landed and tail in landed:
+                time.sleep(2)
+                return
+            time.sleep(2)
+    raise UmsError(f"the {page} hand-off did not land; the session may have expired")
+
+
+def _read_spa(browser):
+    attendance, messages, marked = {}, [], {}
+    try:
+        open_spa(browser, "dashboard")
+        attendance = parse_attendance(browser.text())
+        coords = browser.js(OPEN_MESSAGES_JS)
+        if coords:
+            pt = json.loads(coords)
+            browser.click(pt["x"], pt["y"])
+            time.sleep(4)
+        messages = parse_messages(json.loads(browser.js(MESSAGES_JS) or "[]"))
+    except UmsError:
+        pass
+    try:
+        open_spa(browser, "calendar")
+        today = date.today()
+        year = today.year if today.month >= 8 else today.year - 1
+        marked = parse_marks(json.loads(browser.js(MARKS_JS) or "[]"), year)
+    except UmsError:
+        pass
+    return attendance, messages, marked
 
 
 def read_all(browser):
@@ -556,23 +592,9 @@ def read_all(browser):
     if not grid:
         raise UmsError("the timetable report did not render a weekly grid")
     sessions = parse_timetable(json.loads(grid))
-
-    open_spa(browser, "dashboard")
-    attendance = parse_attendance(browser.text())
-    coords = browser.js(OPEN_MESSAGES_JS)
-    if coords:
-        pt = json.loads(coords)
-        browser.click(pt["x"], pt["y"])
-        time.sleep(4)
-    messages = parse_messages(json.loads(browser.js(MESSAGES_JS) or "[]"))
-
-    open_spa(browser, "calendar")
-    today = date.today()
-    year = today.year if today.month >= 8 else today.year - 1
-    marked = parse_marks(json.loads(browser.js(MARKS_JS) or "[]"), year)
-
     if not sessions:
         raise UmsError("read zero classes; refusing to store an empty week over a good one")
+    attendance, messages, marked = _read_spa(browser)
     return {"at": datetime.now().isoformat(timespec="seconds"), "sessions": sessions,
             "attendance": attendance, "messages": messages, "marked": marked}
 
@@ -661,11 +683,18 @@ def write_ics(snap, tasks):
     ICS.write_text("\r\n".join(lines) + "\r\n", encoding="utf-8")
 
 
+def telegram_creds():
+    cfg = load(CONFIG, {})
+    token = cfg.get("telegram_token") or os.environ.get("CAMPUS_TELEGRAM_TOKEN")
+    chat = cfg.get("telegram_chat") or os.environ.get("CAMPUS_TELEGRAM_CHAT")
+    return token, chat
+
+
 def notify(title, message):
     _desktop(title, message)
-    cfg = load(CONFIG, {})
-    if cfg.get("telegram_token") and cfg.get("telegram_chat"):
-        _telegram(cfg["telegram_token"], cfg["telegram_chat"], title, message)
+    token, chat = telegram_creds()
+    if token and chat:
+        _telegram(token, chat, title, message)
 
 
 def _desktop(title, message):
@@ -752,6 +781,9 @@ def save(path, data):
 
 
 def credentials():
+    env_user, env_pass = os.environ.get("CAMPUS_USER"), os.environ.get("CAMPUS_PASSWORD")
+    if env_user and env_pass:
+        return env_user.strip(), env_pass.strip()
     saved = load(CREDS, None)
     if saved and saved.get("user") and saved.get("password"):
         return saved["user"], saved["password"]
@@ -770,6 +802,8 @@ def credentials():
 
 
 def setup_telegram():
+    if os.environ.get("CAMPUS_TELEGRAM_TOKEN") or os.environ.get("CAMPUS_USER"):
+        return
     cfg = load(CONFIG, {})
     if cfg.get("telegram_token"):
         return
@@ -828,24 +862,38 @@ def sync_once(user, password):
         return read_all(br)
 
 
-def run_once(announce=True):
-    user, password = credentials()
-    setup_telegram()
-    HOME.mkdir(parents=True, exist_ok=True)
-    if announce:
-        print("checking UMS…")
-    new = sync_once(user, password)
+def _merge_forward(old, new):
+    if old:
+        for k in ("attendance", "messages", "marked"):
+            if not new.get(k) and old.get(k):
+                new[k] = old[k]
+    return new
+
+
+def check(user, password):
     old = load(STATE, None)
+    new = _merge_forward(old, sync_once(user, password))
     diff = changes(old, new)
     save(STATE, new)
     write_ics(new, load(TASKS, []))
     if diff:
-        body = "\n".join(f"- {c}" for c in diff[:8])
-        notify("UMS changed", body)
-        print("changes:\n" + body)
-    else:
-        print("no change" if announce else "", end="" if not announce else "\n")
+        notify("UMS changed", "\n".join(f"- {c}" for c in diff[:8]))
+    for t in due_reminders():
+        notify("Reminder", f"{t['text']} — due {t['when']}")
     return diff
+
+
+def run_once():
+    user, password = credentials()
+    setup_telegram()
+    print("checking UMS…")
+    diff = check(user, password)
+    if not diff:
+        print("no change")
+    elif os.environ.get("CAMPUS_QUIET"):
+        print(f"{len(diff)} change(s) — sent to your notifications")
+    else:
+        print("changes:\n" + "\n".join(f"- {c}" for c in diff))
 
 
 def run_loop():
@@ -854,27 +902,16 @@ def run_loop():
     user, password = credentials()
     setup_telegram()
     while True:
+        stamp = datetime.now().strftime("%H:%M")
         try:
-            new = sync_once(user, password)
-            old = load(STATE, None)
-            diff = changes(old, new)
-            save(STATE, new)
-            write_ics(new, load(TASKS, []))
-            stamp = datetime.now().strftime("%H:%M")
-            if diff:
-                body = "\n".join(f"- {c}" for c in diff[:8])
-                notify("UMS changed", body)
-                print(f"[{stamp}] {len(diff)} change(s):\n" + body)
-            else:
-                print(f"[{stamp}] no change")
+            diff = check(user, password)
+            print(f"[{stamp}] {len(diff)} change(s):\n" + "\n".join(f"- {c}" for c in diff)
+                  if diff else f"[{stamp}] no change")
         except UmsError as exc:
-            print(f"[{datetime.now():%H:%M}] sync skipped: {exc}")
+            print(f"[{stamp}] sync skipped: {exc}")
         except KeyboardInterrupt:
             print("\nstopped.")
             return
-        for t in due_reminders():
-            notify("Reminder", f"{t['text']} — due {t['when']}")
-            print(f"reminder fired: {t['text']}")
         try:
             time.sleep(INTERVAL_MIN * 60)
         except KeyboardInterrupt:
@@ -930,6 +967,8 @@ def main(argv):
         for t in load(TASKS, []):
             mark = "done" if t.get("notified") else "pending"
             print(f"{t['when']}  [{mark}]  {t['text']}")
+    elif cmd == "chatid" and len(argv) >= 2:
+        print(telegram_chat_id(argv[1]) or "no message found — send your bot 'hi' first, then retry")
     elif cmd == "bomb":
         bomb()
     else:
