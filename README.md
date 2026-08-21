@@ -58,9 +58,11 @@ python campus.py
 ```
 
 The first time, it asks for your UMS registration number and password (used only on your
-machine, sent only to `ums.lpu.in`), and offers to save them so it won't ask again. It also
-offers to connect a Telegram bot for phone alerts. Then it watches UMS every 45 minutes and
-tells you when something changes. Leave it running (minimise the window).
+machine, sent only to `ums.lpu.in`), and offers to save them so it won't ask again. If you save
+them, it also offers to **start automatically every time you log in** — say yes and you never
+have to open a terminal for this again, even after a reboot. It also offers to connect a Telegram
+bot for phone alerts. Then it watches UMS every 45 minutes and tells you when something changes.
+If you didn't turn on autostart, leave the window running (minimise it).
 
 **Other commands:**
 
@@ -68,6 +70,8 @@ tells you when something changes. Leave it running (minimise the window).
 python campus.py once                                  # check right now, then exit
 python campus.py remind "submit DBMS assignment" "2026-08-25 17:00"
 python campus.py reminders                             # list what you asked it to remember
+python campus.py autostart                              # turn on start-at-login
+python campus.py autostart off                          # turn it back off
 python campus.py bomb                                  # delete everything (see below)
 ```
 
@@ -79,16 +83,49 @@ python campus.py bomb                                  # delete everything (see 
 
 Now cancellations and reminders reach your phone even when the laptop screen is off.
 
+## Starting automatically after a reboot
+
+Say yes when it offers this on first run, or turn it on any time:
+
+```
+python campus.py autostart
+```
+
+This makes campus start itself the next time you log in — no need to open a terminal and run it
+by hand again. It only works if you've saved your login (autostart has nothing to run otherwise).
+To turn it back off: `python campus.py autostart off`. It's also removed automatically if you
+run `python campus.py bomb`.
+
+- **Linux** — adds a start-on-login entry (`~/.config/autostart`). Live-tested on Linux Mint.
+- **macOS** — adds a Login Item (`~/Library/LaunchAgents`). Implemented and code-reviewed, but not
+  tested on an actual Mac — if it doesn't work, `python campus.py once` still works fine, just run
+  it manually.
+- **Windows** — adds a Task Scheduler entry that runs at logon. Same caveat: not tested on a real
+  Windows machine yet.
+
+If autostart doesn't work on your machine, nothing is broken — just run `python campus.py` by
+hand, or see the always-on options below.
+
+When running via autostart there's no visible window, so its output goes to
+`~/.campus/campus.log` instead — check that file if you want to see what it's been doing. If UMS
+login starts failing repeatedly (most likely because your password changed — UMS forces a reset
+every 90 days), campus notices after 3 failed attempts in a row and sends you a notification
+saying so, instead of silently going quiet forever.
+
+If you move or rename `campus.py` (or the folder it's in) after turning autostart on, the entry
+still points at the old location and will quietly fail. Turn autostart off first, move things,
+then turn it back on.
+
 ## Keeping it always on
 
 campus only catches a change while it's running, so for round-the-clock alerts it needs to live
 on a machine that stays on. The simplest options:
 
-- **Leave it running on your laptop.** Fine if your laptop is usually on and online. Sleep pauses
-  it; it resumes when the laptop wakes.
+- **Leave it running on your laptop** (with autostart on, above). Fine if your laptop is usually
+  on and online. Sleep pauses it; it resumes when the laptop wakes.
 - **A spare/old machine at home** — an old laptop, a mini-PC, a Raspberry Pi with Chromium — left
-  plugged in. Telegram still delivers to your phone wherever you are. This is the real "set and
-  forget" setup.
+  plugged in, with autostart on. Telegram still delivers to your phone wherever you are. This is
+  the real "set and forget" setup.
 
 To run it without it asking questions each time (useful for a background machine), set the login
 as environment variables and it won't prompt:
@@ -127,8 +164,8 @@ To wipe all of it — login, token, calendar, reminders, everything:
 python campus.py bomb
 ```
 
-It asks you to type `DELETE`, then removes the whole `~/.campus` folder. Delete `campus.py` too
-and there's no trace left.
+It asks you to type `DELETE`, then turns off autostart (if it was on) and removes the whole
+`~/.campus` folder. Delete `campus.py` too and there's no trace left.
 
 ## Honest limitations
 
