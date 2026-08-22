@@ -16,7 +16,10 @@ changes. One Python file. Runs on your own machine. No server, no account, no we
   placement-related mail and notifies you, the same way it does for UMS changes. Read-only —
   it can never delete, label, or send anything.
 - **Reminders** — tell it what to do and when; it notifies you and puts it on the calendar.
-- **Phone alerts** — connect a Telegram bot and every alert reaches your phone, screen off or not.
+- **Phone alerts and control** — connect a Telegram bot and every alert reaches your phone, screen
+  off or not. Once it's connected, you can also run campus from your phone — check status, force
+  a sync, add reminders, turn things off, even wipe everything — by texting the bot. No terminal
+  needed after the first setup.
 - **Autostart** — one command and it starts itself every time you log in, no terminal needed.
 
 ## Install
@@ -80,6 +83,29 @@ Calendar connects with events read/write access to just that one calendar it cre
 existing calendars. Gmail connects read-only, subject lines only, never your other calendars,
 never full message bodies. `python campus.py permissions` shows what's currently connected.
 
+## Controlling it from your phone
+
+Once you've connected Telegram, campus listens for commands from that same chat — so after the
+one-time setup (on whatever computer campus is running on), you never need a terminal again:
+
+| Text this | It does |
+|---|---|
+| `/status` | What's connected, and the last sync summary |
+| `/sync` | Check UMS right now |
+| `/remind text \| 2026-08-25 17:00` | Add a reminder |
+| `/reminders` | List them |
+| `/disable calendar` or `/disable gmail` | Disconnect one |
+| `/autostart` or `/autostart off` | Toggle start-on-login |
+| `/bomb` | Delete everything (replies asking you to confirm) |
+| `/help` | List of commands |
+
+Only the chat that's already connected can control it — messages from anyone else are ignored.
+One thing that can't happen over Telegram: **connecting** Calendar or Gmail for the first time —
+that needs an actual browser on the machine campus runs on (that's how Google's approval screen
+works, not a campus limitation). Texting `/enable calendar` explains this and tells you the
+command to run there instead. Once connected, everything else — including disconnecting — works
+from your phone.
+
 ## Deleting everything
 
 ```
@@ -90,6 +116,9 @@ Type `DELETE` to confirm. This stops any running background copy, turns off auto
 Calendar and Gmail (revoking their access and deleting the campus calendar it created), and
 removes the entire `~/.campus` folder — your saved login, Telegram token, calendar file, and
 reminders. Delete `campus.py` itself too and there's no trace left.
+
+Or text `/bomb` from your phone — it replies asking you to reply `CONFIRM` within 60 seconds, then
+does the same thing.
 
 ## Where your data goes
 

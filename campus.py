@@ -16,6 +16,9 @@ Disconnect:        python campus.py disable calendar  (or: gmail)
 What's connected:  python campus.py permissions
 Delete everything: python campus.py bomb
 
+Once a Telegram bot is connected, campus also listens for commands from your phone —
+/status /sync /remind /reminders /disable /autostart /bomb /help — while the loop runs.
+
 Needs: Python 3.9+, Google Chrome or Microsoft Edge, and one package:
     pip install websocket-client
 """
@@ -36,6 +39,7 @@ import signal
 import socket
 import subprocess
 import sys
+import threading
 import time
 import urllib.error
 import urllib.parse
@@ -54,6 +58,7 @@ PROFILE = HOME / "browser"
 LOCK = HOME / "campus.lock"
 PIDFILE = HOME / "campus.pid"
 FAILS = HOME / "fails.json"
+BOTFILE = HOME / "bot.json"
 LOG = HOME / "campus.log"
 
 PORTAL = "https://ums.lpu.in/lpuums/"
@@ -1100,9 +1105,148 @@ def telegram_chat_id(token):
         return None
     for update in reversed(body.get("result", [])):
         chat = (update.get("message") or update.get("edited_message") or {}).get("chat", {})
-        if chat.get("id") is not None:
+        if chat.get("id") is not None and chat.get("type") == "private":
             return str(chat["id"])
     return None
+
+
+def _telegram_get(token, params):
+    url = f"https://api.telegram.org/bot{token}/getUpdates?" + urllib.parse.urlencode(params)
+    try:
+        with urllib.request.urlopen(url, timeout=params.get("timeout", 0) + 10) as r:
+            return json.load(r)
+    except Exception:
+        return None
+
+
+def _bot_status_text():
+    state = load(STATE, None)
+    lines = [f"sessions: {len(state.get('sessions', []))}, notices: {len(state.get('messages', []))}"
+             if state else "no UMS sync yet"]
+    for module in GOOGLE_SCOPES:
+        connected = bool(load(_google_token_path(module), None))
+        lines.append(f"{module}: {'connected' if connected else 'off'}")
+    lines.append(f"autostart: {'on' if _autostart_enabled() else 'off'}")
+    return "\n".join(lines)
+
+
+def _bot_help_text():
+    return ("/status — what's connected and last sync\n"
+            "/sync — check UMS right now\n"
+            '/remind text | 2026-08-25 17:00 — add a reminder\n'
+            "/reminders — list them\n"
+            "/disable calendar or /disable gmail — disconnect one\n"
+            "/autostart or /autostart off\n"
+            "/bomb — delete everything (asks to confirm)")
+
+
+def _bot_command(token, chat, text, user, password, bomb_deadline, drain_fn=None):
+    if bomb_deadline[0] and time.time() < bomb_deadline[0] and text.strip().upper() == "CONFIRM":
+        bomb_deadline[0] = None
+        _telegram(token, chat, "campus", "wiping everything — campus is shutting down now.")
+        if drain_fn:
+            try:
+                drain_fn()
+            except Exception:
+                pass
+        try:
+            _bomb_now()
+        finally:
+            os._exit(0)
+    bomb_deadline[0] = None
+    parts = text.split(None, 1)
+    cmd = parts[0].lower().lstrip("/").split("@")[0]
+    rest = parts[1].strip() if len(parts) > 1 else ""
+    if cmd == "status":
+        _telegram(token, chat, "campus", _bot_status_text())
+    elif cmd in ("sync", "check"):
+        if LOCK.exists() and time.time() - LOCK.stat().st_mtime < 300:
+            _telegram(token, chat, "campus", "sync already running, try again in a minute.")
+        else:
+            try:
+                diff = check(user, password)
+                body = "\n".join(f"- {c}" for c in diff) if diff else "no change"
+            except UmsError as exc:
+                body = f"sync failed: {exc}"
+            _telegram(token, chat, "campus", body)
+    elif cmd == "remind" and "|" in rest:
+        text_part, when_part = (p.strip() for p in rest.split("|", 1))
+        try:
+            when = datetime.fromisoformat(when_part.replace(" ", "T", 1))
+            when_iso = when.isoformat(timespec="minutes")
+            add_reminder(text_part, when_iso)
+            _telegram(token, chat, "campus", f"reminder set: {text_part} — {when_iso}")
+        except ValueError:
+            _telegram(token, chat, "campus", 'use: /remind text | 2026-08-25 17:00')
+    elif cmd == "reminders":
+        tasks = load(TASKS, [])
+        body = "\n".join(f"{t['when']}  {t['text']}" for t in tasks) if tasks else "no reminders"
+        _telegram(token, chat, "campus", body)
+    elif cmd in ("enable", "disable") and rest.split(None, 1)[:1] and rest.split(None, 1)[0] in GOOGLE_SCOPES:
+        module = rest.split(None, 1)[0]
+        if cmd == "disable":
+            google_disable(module)
+            _telegram(token, chat, "campus", f"{module} disconnected.")
+        else:
+            _telegram(token, chat, "campus",
+                      f"connecting {module} needs a one-time browser step on the computer campus "
+                      f"runs on — run 'python campus.py enable {module}' there.")
+    elif cmd == "autostart":
+        if rest.strip().lower() == "off":
+            autostart_disable()
+            _telegram(token, chat, "campus", "autostart turned off.")
+        else:
+            ok = autostart_enable()
+            _telegram(token, chat, "campus", "autostart turned on." if ok else "couldn't turn on autostart.")
+    elif cmd == "bomb":
+        bomb_deadline[0] = time.time() + 60
+        _telegram(token, chat, "campus", "reply CONFIRM within 60 seconds to delete everything.")
+    elif cmd == "help":
+        _telegram(token, chat, "campus", _bot_help_text())
+    else:
+        _telegram(token, chat, "campus", "unknown command. /help for the list.")
+
+
+def _telegram_listen(stop_event, user, password):
+    token, chat = telegram_creds()
+    if not token or not chat:
+        return
+    state = load(BOTFILE, {"last_update_id": 0})
+    bomb_deadline = [None]
+    started_at = time.time()
+    while not stop_event.is_set():
+        try:
+            body = _telegram_get(token, {"timeout": 25, "offset": state["last_update_id"] + 1})
+            if not body or not body.get("ok"):
+                if stop_event.wait(5):
+                    return
+                continue
+            for update in body.get("result", []):
+                uid = update.get("update_id")
+                if uid is None:
+                    continue
+                state["last_update_id"] = max(state.get("last_update_id", 0), uid)
+                msg = update.get("message") or {}
+                if msg.get("date", 0) < started_at:
+                    save(BOTFILE, state)
+                    continue
+                if msg.get("chat", {}).get("type") != "private":
+                    continue
+                incoming_from = str((msg.get("from") or {}).get("id", ""))
+                text = (msg.get("text") or "").strip()
+                if incoming_from != str(chat) or not text:
+                    continue
+                save(BOTFILE, state)
+                def _drain(tok=token, last=state):
+                    _telegram_get(tok, {"timeout": 0, "offset": last["last_update_id"] + 1})
+                try:
+                    _bot_command(token, chat, text, user, password, bomb_deadline, drain_fn=_drain)
+                except Exception as exc:
+                    _telegram(token, chat, "campus", f"command failed: {exc}")
+            save(BOTFILE, state)
+        except Exception:
+            if stop_event.wait(10):
+                return
 
 
 def ask(prompt):
@@ -1158,6 +1302,22 @@ def _autostart_plist_path():
 
 def _autostart_task_name():
     return f"campus-{getpass.getuser()}"
+
+
+def _autostart_enabled():
+    system = platform.system()
+    if system == "Linux":
+        return _autostart_desktop_path().exists()
+    if system == "Darwin":
+        return _autostart_plist_path().exists()
+    if system == "Windows":
+        try:
+            result = subprocess.run(["schtasks", "/query", "/tn", _autostart_task_name()],
+                                     capture_output=True, timeout=10)
+            return result.returncode == 0
+        except Exception:
+            return False
+    return False
 
 
 def _desktop_quote(value):
@@ -1410,6 +1570,8 @@ def run_loop():
     setup_telegram()
     HOME.mkdir(parents=True, exist_ok=True)
     PIDFILE.write_text(str(os.getpid()), encoding="utf-8")
+    stop_event = threading.Event()
+    threading.Thread(target=_telegram_listen, args=(stop_event, user, password), daemon=True).start()
     try:
         while True:
             stamp = datetime.now().strftime("%H:%M")
@@ -1425,21 +1587,17 @@ def run_loop():
                 print("\nstopped.")
                 return
             try:
-                time.sleep(INTERVAL_MIN * 60)
+                if stop_event.wait(INTERVAL_MIN * 60):
+                    return
             except KeyboardInterrupt:
                 print("\nstopped.")
                 return
     finally:
+        stop_event.set()
         PIDFILE.unlink(missing_ok=True)
 
 
-def bomb():
-    print("This deletes EVERYTHING campus stored: your saved login, Telegram token,")
-    print("the calendar file, reminders, the browser profile, and any Google Calendar /")
-    print(f"Gmail connection — all of {HOME}.")
-    if ask('Type DELETE to confirm: ').strip() != "DELETE":
-        print("cancelled.")
-        return
+def _bomb_now():
     try:
         if load(_google_token_path("calendar"), None):
             try:
@@ -1454,13 +1612,24 @@ def bomb():
         autostart_disable()
         if PIDFILE.exists():
             try:
-                os.kill(int(PIDFILE.read_text(encoding="utf-8").strip()), signal.SIGTERM)
-                print("stopped the background campus process that was running.")
+                pid = int(PIDFILE.read_text(encoding="utf-8").strip())
+                if pid != os.getpid():
+                    os.kill(pid, signal.SIGTERM)
             except (OSError, ValueError):
                 pass
     finally:
         if HOME.exists():
             shutil.rmtree(HOME, ignore_errors=True)
+
+
+def bomb():
+    print("This deletes EVERYTHING campus stored: your saved login, Telegram token,")
+    print("the calendar file, reminders, the browser profile, and any Google Calendar /")
+    print(f"Gmail connection — all of {HOME}.")
+    if ask('Type DELETE to confirm: ').strip() != "DELETE":
+        print("cancelled.")
+        return
+    _bomb_now()
     print("done — campus wiped itself. Delete campus.py too if you're finished with it.")
 
 
