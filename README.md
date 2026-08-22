@@ -37,6 +37,9 @@ If `pip install` fails with `externally-managed-environment` (common on Linux/Ma
 pip install --break-system-packages websocket-client
 ```
 
+On Linux/Mac, if `python`/`pip` aren't found, use `python3`/`pip3` instead — every command below
+then becomes `python3 campus.py ...`.
+
 Headless Linux server (no display): also `sudo apt install xvfb`.
 
 ## Commands

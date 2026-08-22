@@ -34,6 +34,7 @@ import os
 import platform
 import plistlib
 import re
+import secrets
 import shutil
 import signal
 import socket
@@ -88,6 +89,9 @@ DAYS = ("Monday", "Tuesday", "Wednesday", "Thursday", "Friday", "Saturday", "Sun
 SHORT = {d: d[:3] for d in DAYS}
 BYDAY = {"Mon": "MO", "Tue": "TU", "Wed": "WE", "Thu": "TH", "Fri": "FR", "Sat": "SA", "Sun": "SU"}
 DAYNUM = {"Mon": 0, "Tue": 1, "Wed": 2, "Thu": 3, "Fri": 4, "Sat": 5, "Sun": 6}
+
+_SYNC_LOCK = threading.Lock()
+_TASKS_LOCK = threading.Lock()
 
 
 class UmsError(RuntimeError):
@@ -149,6 +153,10 @@ def chrome_binary():
                     p = Path(base) / rel
                     if p.exists():
                         return str(p)
+        for name in ("chrome.exe", "msedge.exe"):
+            found = shutil.which(name)
+            if found:
+                return found
         raise UmsError("Chrome or Edge not found; install Google Chrome")
     if system == "Darwin":
         for p in ("/Applications/Google Chrome.app/Contents/MacOS/Google Chrome",
@@ -163,6 +171,9 @@ def chrome_binary():
     raise UmsError("no chrome/chromium/edge found; install Google Chrome")
 
 
+_active_browser = None
+
+
 class Browser:
     def __init__(self):
         with socket.socket() as s:
@@ -170,11 +181,15 @@ class Browser:
             self.port = s.getsockname()[1]
         self.proc = None
         self.xvfb = None
+        self.xauth = None
         self.target = None
 
     def __enter__(self):
+        global _active_browser
         try:
-            return self._start()
+            self._start()
+            _active_browser = self
+            return self
         except Exception:
             self.close()
             raise
@@ -185,12 +200,21 @@ class Browser:
         if system not in ("Windows", "Darwin") and not env.get("DISPLAY"):
             if not shutil.which("Xvfb"):
                 raise UmsError("no screen and no Xvfb; run from your desktop or: sudo apt install xvfb")
+            have_xauth = shutil.which("xauth")
+            if have_xauth:
+                HOME.mkdir(parents=True, exist_ok=True)
+                self.xauth = HOME / f"xvfb-{os.getpid()}.xauth"
+                cookie = secrets.token_hex(16)
             for n in range(80, 100):
                 if Path(f"/tmp/.X{n}-lock").exists():
                     continue
-                cand = subprocess.Popen(
-                    ["Xvfb", f":{n}", "-screen", "0", f"{WINDOW[0]}x{WINDOW[1]}x24", "-nolisten", "tcp"],
-                    stdout=subprocess.DEVNULL, stderr=subprocess.DEVNULL)
+                xvfb_argv = ["Xvfb", f":{n}", "-screen", "0", f"{WINDOW[0]}x{WINDOW[1]}x24", "-nolisten", "tcp"]
+                if have_xauth:
+                    subprocess.run(["xauth", "-f", str(self.xauth), "add", f":{n}", ".", cookie],
+                                    capture_output=True)
+                    env["XAUTHORITY"] = str(self.xauth)
+                    xvfb_argv += ["-auth", str(self.xauth)]
+                cand = subprocess.Popen(xvfb_argv, stdout=subprocess.DEVNULL, stderr=subprocess.DEVNULL)
                 time.sleep(1.5)
                 if cand.poll() is None:
                     self.xvfb, env["DISPLAY"] = cand, f":{n}"
@@ -198,6 +222,11 @@ class Browser:
             else:
                 raise UmsError("no free X display")
         PROFILE.mkdir(parents=True, exist_ok=True)
+        if os.name != "nt":
+            try:
+                PROFILE.chmod(0o700)
+            except OSError:
+                pass
         argv = [chrome_binary(), f"--remote-debugging-port={self.port}",
                 "--remote-debugging-address=127.0.0.1", f"--user-data-dir={PROFILE}",
                 f"--window-size={WINDOW[0]},{WINDOW[1]}",
@@ -231,6 +260,7 @@ class Browser:
         self.close()
 
     def close(self):
+        global _active_browser
         for child in (self.proc, self.xvfb):
             if child and child.poll() is None:
                 child.terminate()
@@ -239,6 +269,11 @@ class Browser:
                 except subprocess.TimeoutExpired:
                     child.kill()
         self.proc = self.xvfb = None
+        if self.xauth:
+            Path(self.xauth).unlink(missing_ok=True)
+            self.xauth = None
+        if _active_browser is self:
+            _active_browser = None
 
     def _targets(self):
         with urllib.request.urlopen(f"http://127.0.0.1:{self.port}/json", timeout=5) as r:
@@ -341,6 +376,8 @@ FORM_STATE_JS = """
 
 
 def login(browser, user, password, attempts=3):
+    reached_form = False
+    submitted = False
     for _ in range(attempts):
         browser.goto(PORTAL)
         deadline = time.time() + 45
@@ -354,6 +391,7 @@ def login(browser, user, password, attempts=3):
             time.sleep(2)
         if not ready:
             continue
+        reached_form = True
         browser.type_into("#txtU", user)
         browser.type_into("input[type=password]", password)
         deadline = time.time() + 25
@@ -372,12 +410,18 @@ def login(browser, user, password, attempts=3):
             continue
         if not browser.click_selector("input[type=submit]"):
             continue
+        submitted = True
         for _ in range(8):
             time.sleep(3)
             if "StudentDashboard" in browser.url():
                 return
-    raise UmsError("login did not reach the dashboard; check your reg number/password "
-                   "(UMS forces a password change every 90 days)")
+    if not reached_form:
+        raise UmsError("the UMS login page never appeared — check your internet connection; "
+                       "ums.lpu.in may also be slow or down right now")
+    if not submitted:
+        raise UmsError("the login form wouldn't accept the details typed into it — try again")
+    raise UmsError("login was submitted but never reached the dashboard; check your reg number/password "
+                   "(UMS forces a password change every 90 days) — ums.lpu.in may also be slow right now")
 
 
 GRID_JS = r"""
@@ -450,7 +494,9 @@ def _to24(span):
     mer = m.group(5)
 
     def fix(h):
-        return h + 12 if (mer == "PM" and h < 9) else h
+        if mer == "PM":
+            return h if h == 12 else h + 12
+        return 0 if h == 12 else h
     return f"{fix(int(m.group(1))):02d}:{m.group(2)}", f"{fix(int(m.group(3))):02d}:{m.group(4)}"
 
 
@@ -611,15 +657,15 @@ def _read_spa(browser):
             browser.click(pt["x"], pt["y"])
             time.sleep(4)
         messages = parse_messages(json.loads(browser.js(MESSAGES_JS) or "[]"))
-    except UmsError:
-        pass
+    except UmsError as exc:
+        print(f"dashboard read skipped: {exc}")
     try:
         open_spa(browser, "calendar")
         today = date.today()
         year = today.year if today.month >= 8 else today.year - 1
         marked = parse_marks(json.loads(browser.js(MARKS_JS) or "[]"), year)
-    except UmsError:
-        pass
+    except UmsError as exc:
+        print(f"calendar read skipped: {exc}")
     return attendance, messages, marked
 
 
@@ -628,6 +674,12 @@ def read_all(browser):
     grid = browser.js(GRID_JS)
     if not grid:
         raise UmsError("the timetable report did not render a weekly grid")
+    time.sleep(1.5)
+    grid2 = browser.js(GRID_JS)
+    if grid2 and grid2 != grid:
+        time.sleep(2)
+        grid2 = browser.js(GRID_JS)
+    grid = grid2 or grid
     sessions = parse_timetable(json.loads(grid))
     if not sessions:
         raise UmsError("read zero classes; refusing to store an empty week over a good one")
@@ -640,22 +692,33 @@ def _skey(s):
     return f"{s['day']} {s['start']}"
 
 
+def _skey_order(key):
+    day, start = key.split(" ", 1)
+    return (DAYNUM[day], start)
+
+
 def changes(old, new):
     if not old:
         return []
     out = []
     before = {_skey(s): s for s in old.get("sessions", [])}
     after = {_skey(s): s for s in new.get("sessions", [])}
-    for key in sorted(set(before) | set(after)):
+    for key in sorted(set(before) | set(after), key=_skey_order):
         was, now = before.get(key), after.get(key)
         if was and not now:
             out.append(f"CANCELLED: {key} {was['code']}")
-        elif now and not was:
+            continue
+        if now and not was:
             out.append(f"NEW: {key} {now['code']} {now['type'].lower()} in {now['room']}")
-        elif was.get("room") != now.get("room"):
+            continue
+        if was.get("room") != now.get("room"):
             out.append(f"MOVED: {key} {now['code']}: {was['room']} -> {now['room']}")
-        elif was.get("code") != now.get("code") or was.get("type") != now.get("type"):
+        if was.get("code") != now.get("code") or was.get("type") != now.get("type"):
             out.append(f"{key}: {was['code']} -> {now['code']}")
+        if was.get("group") != now.get("group"):
+            out.append(f"{key} {now['code']}: group {was.get('group')} -> {now.get('group')}")
+        if was.get("end") != now.get("end"):
+            out.append(f"{key} {now['code']}: now ends {now.get('end')} (was {was.get('end')})")
     ba, aa = old.get("attendance", {}), new.get("attendance", {})
     for code in sorted(set(ba) | set(aa)):
         if code != "overall" and ba.get(code) != aa.get(code) and code in ba and code in aa:
@@ -689,7 +752,10 @@ def write_ics(snap, tasks):
     stamp = datetime.now().strftime("%Y%m%dT%H%M%S")
     anchor, end, holidays = _term_window(snap)
     lines = ["BEGIN:VCALENDAR", "VERSION:2.0", "PRODID:-//campus//EN", "CALSCALE:GREGORIAN",
-             "METHOD:PUBLISH", "X-WR-CALNAME:LPU timetable (campus)"]
+             "METHOD:PUBLISH", "X-WR-CALNAME:LPU timetable (campus)",
+             "BEGIN:VTIMEZONE", "TZID:Asia/Kolkata", "BEGIN:STANDARD",
+             "DTSTART:19700101T000000", "TZOFFSETFROM:+0530", "TZOFFSETTO:+0530",
+             "TZNAME:IST", "END:STANDARD", "END:VTIMEZONE"]
     for s in snap.get("sessions", []):
         wd = DAYNUM[s["day"]]
         first = anchor + timedelta(days=(wd - anchor.weekday()) % 7)
@@ -698,10 +764,10 @@ def write_ics(snap, tasks):
               if h.weekday() == wd and first <= h <= end]
         lines += ["BEGIN:VEVENT",
                   f"UID:{_session_uid(s)}",
-                  f"DTSTAMP:{stamp}", f"DTSTART:{first.strftime('%Y%m%d')}T{sc}",
-                  f"DTEND:{first.strftime('%Y%m%d')}T{ec}",
+                  f"DTSTAMP:{stamp}", f"DTSTART;TZID=Asia/Kolkata:{first.strftime('%Y%m%d')}T{sc}",
+                  f"DTEND;TZID=Asia/Kolkata:{first.strftime('%Y%m%d')}T{ec}",
                   f"RRULE:FREQ=WEEKLY;BYDAY={BYDAY[s['day']]};UNTIL={end.strftime('%Y%m%d')}T235959"]
-        lines += [f"EXDATE:{e}" for e in ex]
+        lines += [f"EXDATE;TZID=Asia/Kolkata:{e}" for e in ex]
         lines += [f"SUMMARY:{_esc(s['code'] + ' ' + s['type'].lower() + ' (' + s['room'] + ')')}",
                   "END:VEVENT"]
     for kind, label in (("mid-term-test", "Mid Term Test"), ("holiday", "Holiday")):
@@ -717,8 +783,8 @@ def write_ics(snap, tasks):
         except ValueError:
             continue
         lines += ["BEGIN:VEVENT", f"UID:campus-task-{t['id']}@campus", f"DTSTAMP:{stamp}",
-                  f"DTSTART:{when.strftime('%Y%m%dT%H%M%S')}",
-                  f"DTEND:{(when + timedelta(hours=1)).strftime('%Y%m%dT%H%M%S')}",
+                  f"DTSTART;TZID=Asia/Kolkata:{when.strftime('%Y%m%dT%H%M%S')}",
+                  f"DTEND;TZID=Asia/Kolkata:{(when + timedelta(hours=1)).strftime('%Y%m%dT%H%M%S')}",
                   f"SUMMARY:{_esc(t['text'])}", "END:VEVENT"]
     lines.append("END:VCALENDAR")
     HOME.mkdir(parents=True, exist_ok=True)
@@ -795,9 +861,10 @@ def google_enable(module):
     server.timeout = 5
     port = server.server_address[1]
     redirect_uri = f"http://localhost:{port}"
+    csrf_state = secrets.token_urlsafe(24)
     auth_url = GOOGLE_AUTH_URL + "?" + urllib.parse.urlencode({
         "client_id": GOOGLE_CLIENT_ID, "redirect_uri": redirect_uri, "response_type": "code",
-        "scope": scope, "access_type": "offline", "prompt": "consent",
+        "scope": scope, "access_type": "offline", "prompt": "consent", "state": csrf_state,
     })
     print(f"\nOpen this link and approve access, then come back here:\n{auth_url}\n")
     try:
@@ -813,6 +880,11 @@ def google_enable(module):
         return False
     if "error" in server.oauth_result:
         print(f"{module} sign-in failed: {server.oauth_result['error'][0]}")
+        return False
+    returned_state = (server.oauth_result.get("state") or [None])[0]
+    if returned_state != csrf_state:
+        print(f"{module} sign-in failed: the callback didn't match this request "
+              "(possible CSRF) — run it again")
         return False
     code = (server.oauth_result.get("code") or [None])[0]
     if not code:
@@ -976,10 +1048,10 @@ def calendar_sync(old, new, tasks):
     for ev in events:
         _gcal_upsert(access, cal_id, ev)
     if old:
-        gone = {_skey(s): s for s in old.get("sessions", [])}.keys() - {_skey(s) for s in new.get("sessions", [])}
-        by_key = {_skey(s): s for s in old.get("sessions", [])}
-        for key in gone:
-            _gcal_delete_event(access, cal_id, _gcal_event_id(_session_uid(by_key[key])))
+        before_uids = {_session_uid(s) for s in old.get("sessions", [])}
+        after_uids = {_session_uid(s) for s in new.get("sessions", [])}
+        for uid in before_uids - after_uids:
+            _gcal_delete_event(access, cal_id, _gcal_event_id(uid))
 
 
 def _gcal_delete_calendar():
@@ -1005,6 +1077,7 @@ def gmail_scan():
     seen_set = set(seen_list)
     found = []
     page_token = None
+    ok = True
     for _ in range(5):
         params = {"q": query, "maxResults": 50}
         if page_token:
@@ -1013,6 +1086,7 @@ def gmail_scan():
         listing, status = _google_api(access, url)
         if status != 200:
             print(f"gmail: couldn't list messages (status {status})")
+            ok = False
             break
         for m in listing.get("messages", []):
             meta_url = ("https://www.googleapis.com/gmail/v1/users/me/messages/" + m["id"] +
@@ -1033,7 +1107,8 @@ def gmail_scan():
         if not page_token:
             break
     tok["seen"] = seen_list[-200:]
-    tok["last_checked"] = int(time.time())
+    if ok:
+        tok["last_checked"] = int(time.time())
     save(_google_token_path("gmail"), tok)
     return found
 
@@ -1062,11 +1137,13 @@ def _desktop(title, message):
         if system == "Linux" and shutil.which("notify-send"):
             subprocess.run(["notify-send", "--app-name=campus", "--", title, message],
                            timeout=10, check=False)
-        elif system == "Darwin":
+            return
+        if system == "Darwin":
             script = (f'display notification "{_applescript_escape(message)}" '
                       f'with title "{_applescript_escape(title)}"')
             subprocess.run(["osascript", "-e", script], timeout=10, check=False)
-        elif system == "Windows":
+            return
+        if system == "Windows":
             ps = ("$ErrorActionPreference='SilentlyContinue';"
                   "Add-Type -AssemblyName System.Windows.Forms;"
                   "$n=New-Object System.Windows.Forms.NotifyIcon;"
@@ -1076,8 +1153,10 @@ def _desktop(title, message):
             env = dict(os.environ, CAMPUS_NOTIFY_TITLE=title, CAMPUS_NOTIFY_MSG=message)
             subprocess.run(["powershell", "-NoProfile", "-Command", ps],
                            timeout=15, check=False, env=env)
-    except Exception:
-        pass
+            return
+        print(f"campus: no desktop notifier on this machine — {title}: {message}")
+    except Exception as exc:
+        print(f"campus: desktop notification failed ({exc!r}) — {title}: {message}")
 
 
 def _telegram(token, chat, title, message):
@@ -1090,8 +1169,10 @@ def _telegram(token, chat, title, message):
             with urllib.request.urlopen(req, timeout=15) as r:
                 if 200 <= r.status < 300:
                     return
-        except Exception:
+                print(f"campus: telegram notify got status {r.status}")
+        except Exception as exc:
             if attempt == 2:
+                print(f"campus: telegram notify failed: {exc!r}")
                 return
             time.sleep(2)
 
@@ -1169,21 +1250,25 @@ def _bot_command(token, chat, text, user, password, bomb_deadline, drain_fn=None
             except UmsError as exc:
                 body = f"sync failed: {exc}"
             _telegram(token, chat, "campus", body)
-    elif cmd == "remind" and "|" in rest:
-        text_part, when_part = (p.strip() for p in rest.split("|", 1))
-        try:
-            when = datetime.fromisoformat(when_part.replace(" ", "T", 1))
-            when_iso = when.isoformat(timespec="minutes")
-            add_reminder(text_part, when_iso)
-            _telegram(token, chat, "campus", f"reminder set: {text_part} — {when_iso}")
-        except ValueError:
+    elif cmd == "remind":
+        if "|" in rest:
+            text_part, when_part = (p.strip() for p in rest.split("|", 1))
+            try:
+                when = datetime.fromisoformat(when_part.replace(" ", "T", 1))
+                when_iso = when.isoformat(timespec="minutes")
+                add_reminder(text_part, when_iso)
+                _telegram(token, chat, "campus", f"reminder set: {text_part} — {when_iso}")
+            except ValueError:
+                _telegram(token, chat, "campus", 'use: /remind text | 2026-08-25 17:00')
+        else:
             _telegram(token, chat, "campus", 'use: /remind text | 2026-08-25 17:00')
     elif cmd == "reminders":
         tasks = load(TASKS, [])
         body = "\n".join(f"{t['when']}  {t['text']}" for t in tasks) if tasks else "no reminders"
         _telegram(token, chat, "campus", body)
-    elif cmd in ("enable", "disable") and rest.split(None, 1)[:1] and rest.split(None, 1)[0] in GOOGLE_SCOPES:
-        module = rest.split(None, 1)[0]
+    elif (cmd in ("enable", "disable") and rest.split(None, 1)[:1]
+          and rest.split(None, 1)[0].lower() in GOOGLE_SCOPES):
+        module = rest.split(None, 1)[0].lower()
         if cmd == "disable":
             google_disable(module)
             _telegram(token, chat, "campus", f"{module} disconnected.")
@@ -1360,7 +1445,9 @@ def autostart_enable():
                   " or check System Settings > Login Items.")
             return False
     elif system == "Windows":
-        tr = f'"{python}" "{script}"'
+        pythonw = str(Path(python).with_name("pythonw.exe"))
+        launcher = pythonw if Path(pythonw).exists() else python
+        tr = f'"{launcher}" "{script}"'
         try:
             result = subprocess.run(
                 ["schtasks", "/create", "/tn", _autostart_task_name(), "/tr", tr, "/sc", "onlogon", "/f"],
@@ -1414,6 +1501,9 @@ def credentials():
     saved = load(CREDS, None)
     if saved and saved.get("user") and saved.get("password"):
         return saved["user"], saved["password"]
+    if not sys.stdin.isatty():
+        raise UmsError("no saved login and no terminal to ask for one — set CAMPUS_USER/"
+                       "CAMPUS_PASSWORD or run 'python campus.py' interactively once first")
     print("\nLog into UMS (used only on this machine, sent only to ums.lpu.in):")
     user = ask("  registration number: ").strip()
     password = ask_secret("  UMS password (hidden): ").strip()
@@ -1437,7 +1527,8 @@ def setup_telegram():
     cfg = load(CONFIG, {})
     if cfg.get("telegram_token"):
         return
-    print("\nWant alerts on your phone via a Telegram bot? (desktop pop-ups work regardless.)")
+    print("\nWant alerts on your phone via a Telegram bot? (desktop pop-ups also work, if this"
+          " machine has a notifier installed — e.g. notify-send on Linux.)")
     if ask("  set up Telegram now? [y/N]: ").strip().lower() not in ("y", "yes"):
         return
     print("  1) in Telegram, message @BotFather -> /newbot -> follow it -> copy the token")
@@ -1456,10 +1547,11 @@ def setup_telegram():
 
 
 def add_reminder(text, when_iso):
-    tasks = load(TASKS, [])
-    tasks.append({"id": fingerprint(text + when_iso)[:8], "text": text, "when": when_iso,
-                  "notified": False})
-    save(TASKS, tasks)
+    with _TASKS_LOCK:
+        tasks = load(TASKS, [])
+        tasks.append({"id": fingerprint(text + when_iso)[:8], "text": text, "when": when_iso,
+                      "notified": False})
+        save(TASKS, tasks)
     print(f"got it — will remind you before {when_iso}: {text}")
     snap = load(STATE, None)
     if snap:
@@ -1467,23 +1559,24 @@ def add_reminder(text, when_iso):
 
 
 def due_reminders():
-    tasks = load(TASKS, [])
-    now = datetime.now()
-    fired, changed = [], False
-    for t in tasks:
-        if t.get("notified"):
-            continue
-        try:
-            when = datetime.fromisoformat(t["when"])
-        except ValueError:
-            continue
-        if when - timedelta(minutes=INTERVAL_MIN + 15) <= now:
-            fired.append(t)
-            t["notified"] = True
-            changed = True
-    if changed:
-        save(TASKS, tasks)
-    return fired
+    with _TASKS_LOCK:
+        tasks = load(TASKS, [])
+        now = datetime.now()
+        fired, changed = [], False
+        for t in tasks:
+            if t.get("notified"):
+                continue
+            try:
+                when = datetime.fromisoformat(t["when"])
+            except ValueError:
+                continue
+            if when - timedelta(minutes=INTERVAL_MIN + 15) <= now:
+                fired.append(t)
+                t["notified"] = True
+                changed = True
+        if changed:
+            save(TASKS, tasks)
+        return fired
 
 
 def sync_once(user, password):
@@ -1504,8 +1597,9 @@ def _record_failure(exc):
     n = load(FAILS, {"count": 0}).get("count", 0) + 1
     save(FAILS, {"count": n})
     if n == 3 or (n > 3 and n % 32 == 0):
-        notify("campus can't log in", f"UMS login has failed {n} times in a row: {exc}\n"
-               "Your password may have changed — run campus.py and re-enter it.")
+        notify("campus can't log in", f"UMS sync has failed {n} times in a row: {exc}\n"
+               "Could be a changed password, a UMS/network outage, or a portal change — "
+               "if it keeps failing, run campus.py and re-enter your details.")
 
 
 def _record_success():
@@ -1513,11 +1607,21 @@ def _record_success():
 
 
 def check(user, password):
-    HOME.mkdir(parents=True, exist_ok=True)
-    if LOCK.exists() and time.time() - LOCK.stat().st_mtime < 300:
+    if not _SYNC_LOCK.acquire(blocking=False):
         print("another campus sync is already in progress — skipping this cycle.")
         return []
-    LOCK.write_text(str(os.getpid()), encoding="utf-8")
+    try:
+        HOME.mkdir(parents=True, exist_ok=True)
+        if LOCK.exists() and time.time() - LOCK.stat().st_mtime < 300:
+            print("another campus sync is already in progress — skipping this cycle.")
+            return []
+        LOCK.write_text(str(os.getpid()), encoding="utf-8")
+        return _check_locked(user, password)
+    finally:
+        _SYNC_LOCK.release()
+
+
+def _check_locked(user, password):
     try:
         old = load(STATE, None)
         new = _merge_forward(old, sync_once(user, password))
@@ -1580,12 +1684,15 @@ def run_loop():
                 print(f"[{stamp}] {len(diff)} change(s):\n" + "\n".join(f"- {c}" for c in diff)
                       if diff else f"[{stamp}] no change")
                 _record_success()
-            except UmsError as exc:
-                print(f"[{stamp}] sync skipped: {exc}")
-                _record_failure(exc)
             except KeyboardInterrupt:
                 print("\nstopped.")
                 return
+            except UmsError as exc:
+                print(f"[{stamp}] sync skipped: {exc}")
+                _record_failure(exc)
+            except Exception as exc:
+                print(f"[{stamp}] sync hit an unexpected error: {exc!r}")
+                _record_failure(exc)
             try:
                 if stop_event.wait(INTERVAL_MIN * 60):
                     return
@@ -1618,6 +1725,11 @@ def _bomb_now():
             except (OSError, ValueError):
                 pass
     finally:
+        if _active_browser is not None:
+            try:
+                _active_browser.close()
+            except Exception:
+                pass
         if HOME.exists():
             shutil.rmtree(HOME, ignore_errors=True)
 
@@ -1657,8 +1769,9 @@ def main(argv):
     try:
         import websocket
         websocket.create_connection
-    except ImportError:
-        print("campus needs one package that isn't installed: websocket-client")
+    except (ImportError, AttributeError):
+        print("campus needs one package that isn't installed (or a different 'websocket'")
+        print("package is shadowing it): websocket-client")
         print("try:   pip install websocket-client")
         print("if that says 'externally-managed-environment', try:")
         print("       pip install --break-system-packages websocket-client")
