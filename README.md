@@ -3,13 +3,24 @@
 ## Install
 
 ```
-pip install --break-system-packages websocket-client
-curl -O https://raw.githubusercontent.com/alok024/campus/main/campus.py
+git clone https://github.com/alok024/campus.git
+cd campus
+pip install --break-system-packages -r requirements.txt
 ```
 
 Needs Python 3.9+ and Google Chrome or Microsoft Edge.
 Headless Linux server: also `sudo apt install xvfb`.
 `python`/`pip` not found: use `python3`/`pip3`.
+
+## Env vars (optional, for non-interactive/headless runs)
+
+| Var | What it does |
+|---|---|
+| `CAMPUS_USER` / `CAMPUS_PASSWORD` | UMS login, skips the interactive prompt |
+| `CAMPUS_TELEGRAM_TOKEN` | Telegram bot token, skips the interactive prompt |
+| `CAMPUS_HOME` | Override the `~/.campus` data directory |
+| `CAMPUS_QUIET` | Suppress non-error console output |
+| `CAMPUS_GOOGLE_CLIENT_ID` / `CAMPUS_GOOGLE_CLIENT_SECRET` | Use your own Google Cloud OAuth client instead of the shared default (all installs share one quota bucket by default; create your own free client in Google Cloud Console → APIs & Services → Credentials if you hit quota errors) |
 
 ## Commands
 
