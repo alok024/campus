@@ -493,11 +493,16 @@ def _to24(span):
         return None
     mer = m.group(5)
 
-    def fix(h):
+    def fix(h, is_end=False):
         if mer == "PM":
             return h if h == 12 else h + 12
-        return 0 if h == 12 else h
-    return f"{fix(int(m.group(1))):02d}:{m.group(2)}", f"{fix(int(m.group(3))):02d}:{m.group(4)}"
+        if h == 12:
+            # a range spanning the noon boundary is labeled "AM" for the whole
+            # span (since it starts before noon); the end of such a range
+            # means 12:00 PM (noon), not 12:00 AM (midnight)
+            return 12 if is_end else 0
+        return h
+    return f"{fix(int(m.group(1))):02d}:{m.group(2)}", f"{fix(int(m.group(3)), True):02d}:{m.group(4)}"
 
 
 def _cell(text):
