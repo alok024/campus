@@ -4,6 +4,21 @@ LPU's UMS and LPU Touch never tell you when a class is cancelled or moved. **cam
 UMS for you and tells you — desktop pop-up, Telegram, and your calendar — the moment something
 changes. One Python file. Runs on your own machine. No server, no account, no website.
 
+## Quick start (60 seconds)
+
+```
+pip install --break-system-packages websocket-client
+curl -O https://raw.githubusercontent.com/alok024/campus/main/campus.py
+python3 campus.py once
+```
+
+That's it — it'll ask for your UMS User ID and password (hidden input), do one sync, and print
+what it found. A Chrome window flashes open briefly during login — that's it passing UMS's
+Cloudflare bot check, not a bug or a virus. Say yes to saving your login when asked, then run
+`python3 campus.py` to start the real watch loop, or `python3 campus.py autostart` to have it
+start itself every time you log in. Everything else below (Telegram, Calendar, Gmail) is optional
+— add it whenever you want.
+
 ## What it provides
 
 - **Change alerts** — cancelled/moved classes and new UMS notices, e.g. `CANCELLED: Wed 10:20
@@ -139,5 +154,23 @@ servers — that's what "connecting" means. campus only ever sends your timetabl
 calendar events) or reads your mail's subject lines (to check for important ones) — never your
 UMS password, never full email bodies, never anything to any server but Google's and your own
 Telegram bot.
+
+## Troubleshooting
+
+- **`externally-managed-environment` error from pip** — normal on recent Debian/Ubuntu/Mint/
+  Homebrew Python installs. Use `pip install --break-system-packages websocket-client` instead.
+- **Chrome window flashes open every sync** — expected, not a bug. UMS puts a Cloudflare bot check
+  in front of login; campus needs a real browser window (not headless) to pass it, so it opens one
+  briefly each time. This also means campus can't run unattended on a cloud server or in CI —
+  datacenter IPs get blocked by that same Cloudflare check. It has to run on a real device you
+  control: your own laptop/desktop, left on (or woken by autostart at login).
+- **"Google hasn't verified this app" during `enable calendar`/`enable gmail`** — expected. It's a
+  small personal tool, not something that's gone through Google's app-review process. You're the
+  developer and the only user, so click "Continue" (not "Back to safety").
+- **A UMS change notification looks wrong right after first setup** — the very first sync has
+  nothing to diff against, so it treats your whole current timetable as "new." Real change alerts
+  only start from the second sync onward.
+- **`python campus.py` vs `python3 campus.py`** — if your system's `python`/`pip` point to Python 2
+  or don't exist, use `python3`/`pip3` for every command in this README instead.
 
 Not affiliated with or endorsed by Lovely Professional University. MIT licensed.
