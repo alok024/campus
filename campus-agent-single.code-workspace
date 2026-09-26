@@ -3,7 +3,7 @@
     { "path": "." }
   ],
   "settings": {
-    "window.title": "${{activeEditorShort}} — products/campus-agent-single",
+    "window.title": "${activeEditorShort} — products/campus-agent-single",
     "files.exclude": {
       "**/.git": true,
       "**/node_modules": true,
